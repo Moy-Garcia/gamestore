@@ -2,72 +2,96 @@
 session_start();
 require_once 'config.php';
 
-if (estaLogueado()) { header('Location: ' . BASE_URL . '/tienda.php'); exit; }
+if (estaLogueado()) {
+    header('Location: ' . BASE_URL . '/tienda.php');
+    exit;
+}
 
-$error = '';
+$error  = '';
+$exito  = false;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $nombre_s  = limpiar($_POST['nombre_s']     ?? '');
-    $ap_pat    = limpiar($_POST['ap_paterno']    ?? '');
-    $ap_mat    = limpiar($_POST['ap_materno']    ?? '');
-    $num_cuenta= limpiar($_POST['num_cuenta']    ?? '');
-    $email     = limpiar($_POST['email']         ?? '');
-    $pass      = $_POST['password']              ?? '';
-    $pass2     = $_POST['password2']             ?? '';
+    // Limpiar campos — strip_tags pero SÍ permitir acentos y ñ
+    $nombre_s  = trim(strip_tags($_POST['nombre_s']   ?? ''));
+    $ap_pat    = trim(strip_tags($_POST['ap_paterno'] ?? ''));
+    $ap_mat    = trim(strip_tags($_POST['ap_materno'] ?? ''));
+    $num_cuenta= trim(strip_tags($_POST['num_cuenta'] ?? ''));
+    $email     = trim(strip_tags($_POST['email']      ?? ''));
+    $pass      = $_POST['password']  ?? '';
+    $pass2     = $_POST['password2'] ?? '';
 
-    // Nombre completo que se guarda en BD
+    // Nombre completo para guardar en BD
     $nombre_completo = trim("$nombre_s $ap_pat $ap_mat");
 
-    if (!$nombre_s || !$ap_pat || !$email || !$pass) {
-        $error = 'Los campos marcados con * son obligatorios.';
+    // ---- Validaciones ----
+    if (empty($nombre_s)) {
+        $error = 'El campo Nombre(s) es obligatorio.';
+    } elseif (empty($ap_pat)) {
+        $error = 'El Apellido Paterno es obligatorio.';
+    } elseif (empty($email)) {
+        $error = 'El correo electrónico es obligatorio.';
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        $error = 'El correo electrónico no tiene un formato válido.';
+        $error = 'El correo "' . htmlspecialchars($email) . '" no tiene un formato válido. Ejemplo correcto: usuario@gmail.com';
     } elseif (strlen($pass) < 6) {
         $error = 'La contraseña debe tener al menos 6 caracteres.';
     } elseif ($pass !== $pass2) {
-        $error = 'Las contraseñas no coinciden.';
-    } elseif ($num_cuenta && !preg_match('/^\d{8,20}$/', $num_cuenta)) {
-        $error = 'El número de cuenta debe tener entre 8 y 20 dígitos.';
+        $error = 'Las contraseñas no coinciden. Verifica que sean idénticas.';
+    } elseif (!empty($num_cuenta) && !preg_match('/^\d{6,20}$/', $num_cuenta)) {
+        $error = 'El número de cuenta solo debe contener dígitos (6 a 20 números).';
     } else {
-        $conn = conectarDB();
-        $stmt = $conn->prepare("SELECT id FROM usuarios WHERE email=?");
-        $stmt->bind_param('s', $email);
-        $stmt->execute();
-        if ($stmt->get_result()->num_rows > 0) {
-            $error = 'Este correo ya está registrado. ¿Olvidaste tu contraseña?';
-        } else {
-            $hash   = password_hash($pass, PASSWORD_DEFAULT);
-            $wallet = '0x' . bin2hex(random_bytes(20));
+        // Intentar registrar en BD
+        try {
+            $conn = conectarDB();
 
-            // Guardamos nombre completo + número de cuenta en el campo nombre
-            // (num_cuenta como referencia en wallet_address si no hay wallet real)
-            $nombre_bd = $nombre_completo;
+            // Verificar si email ya existe
+            $stmt = $conn->prepare("SELECT id FROM usuarios WHERE email = ?");
+            $stmt->bind_param('s', $email);
+            $stmt->execute();
+            $stmt->store_result();
 
-            $stmt2 = $conn->prepare(
-                "INSERT INTO usuarios (nombre, email, password, wallet_address) VALUES (?,?,?,?)"
-            );
-            $stmt2->bind_param('ssss', $nombre_bd, $email, $hash, $wallet);
-
-            if ($stmt2->execute()) {
-                $id = $conn->insert_id;
-                $_SESSION['usuario_id'] = $id;
-                $_SESSION['nombre']     = $nombre_bd;
-                $_SESSION['email']      = $email;
-                $_SESSION['rol']        = 'cliente';
-
-                // Guardar número de cuenta en sesión si existe
-                if ($num_cuenta) {
-                    $_SESSION['num_cuenta'] = $num_cuenta;
-                }
-
-                $conn->close();
-                header('Location: ' . BASE_URL . '/tienda.php');
-                exit;
+            if ($stmt->num_rows > 0) {
+                $error = 'Este correo ya está registrado. ¿Quieres <a href="index.php" style="color:var(--cyan)">iniciar sesión</a>?';
             } else {
-                $error = 'Error al registrar. Por favor intenta de nuevo.';
+                $stmt->close();
+
+                $hash   = password_hash($pass, PASSWORD_DEFAULT);
+                $wallet = '0x' . bin2hex(random_bytes(20));
+
+                $stmt2 = $conn->prepare(
+                    "INSERT INTO usuarios (nombre, email, password, wallet_address) VALUES (?, ?, ?, ?)"
+                );
+                $stmt2->bind_param('ssss', $nombre_completo, $email, $hash, $wallet);
+
+                if ($stmt2->execute()) {
+                    $nuevo_id = $conn->insert_id;
+
+                    // Guardar número de cuenta en log si existe
+                    if (!empty($num_cuenta)) {
+                        $desc = "Registro. Núm. cuenta: $num_cuenta";
+                        $conn->query("INSERT INTO actividad_log (usuario_id, accion, descripcion)
+                                      VALUES ($nuevo_id, 'REGISTRO', " . $conn->real_escape_string($desc) . ")");
+                    }
+
+                    // Iniciar sesión automáticamente
+                    $_SESSION['usuario_id'] = $nuevo_id;
+                    $_SESSION['nombre']     = $nombre_completo;
+                    $_SESSION['email']      = $email;
+                    $_SESSION['rol']        = 'cliente';
+                    if (!empty($num_cuenta)) {
+                        $_SESSION['num_cuenta'] = $num_cuenta;
+                    }
+
+                    $conn->close();
+                    header('Location: ' . BASE_URL . '/tienda.php');
+                    exit;
+                } else {
+                    $error = 'Error al guardar el registro: ' . $conn->error;
+                }
             }
+            $conn->close();
+        } catch (Exception $e) {
+            $error = 'Error del servidor: ' . $e->getMessage();
         }
-        $conn->close();
     }
 }
 
@@ -75,20 +99,35 @@ $page_title = 'Crear cuenta';
 include 'header.php';
 ?>
     <style>
-        .registro-wrap{max-width:560px;margin:0 auto;padding:20px 0}
-        .registro-wrap h1{font-family:'Orbitron',monospace;font-size:1.5rem;color:var(--cyan);margin-bottom:6px}
-        .registro-wrap .sub{color:var(--text-dim);margin-bottom:28px;font-size:.95rem}
-        .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-        .form-grid .full{grid-column:1/-1}
-        .campo-req{color:var(--red);margin-left:2px}
-        .hint{font-size:.75rem;color:var(--text-dim);margin-top:4px}
-        .divider-reg{text-align:center;color:var(--text-dim);font-size:.82rem;margin:20px 0;position:relative}
-        .divider-reg::before,.divider-reg::after{content:'';position:absolute;top:50%;width:44%;height:1px;background:var(--border)}
-        .divider-reg::before{left:0}.divider-reg::after{right:0}
-        .strength-bar{height:3px;background:rgba(255,255,255,.1);border-radius:2px;margin-top:6px;overflow:hidden}
+        .registro-wrap{max-width:580px;margin:0 auto;padding:16px 0 40px}
+        .registro-wrap h1{font-family:'Orbitron',monospace;font-size:1.4rem;color:var(--cyan);margin-bottom:6px}
+        .registro-wrap .sub{color:var(--text-dim);margin-bottom:24px;font-size:.92rem}
+
+        .form-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+        .form-grid-2 .full{grid-column:1/-1}
+
+        .campo-req{color:var(--red);margin-left:2px;font-size:.9rem}
+        .campo-hint{font-size:.72rem;color:var(--text-dim);margin-top:4px;line-height:1.4}
+
+        /* Indicador fuerza contraseña */
+        .strength-bar{height:3px;background:rgba(255,255,255,.08);border-radius:2px;margin-top:5px;overflow:hidden}
         .strength-fill{height:100%;border-radius:2px;width:0;transition:width .3s,background .3s}
-        .strength-txt{font-size:.72rem;color:var(--text-dim);margin-top:3px}
-        @media(max-width:500px){.form-grid{grid-template-columns:1fr}}
+        .strength-lbl{font-size:.72rem;margin-top:3px;color:var(--text-dim)}
+
+        /* Confirmación de coincidencia */
+        .match-ok {font-size:.72rem;color:var(--green);margin-top:4px}
+        .match-err{font-size:.72rem;color:var(--red);  margin-top:4px}
+
+        .sec-title{
+            font-family:'Orbitron',monospace;font-size:.8rem;color:var(--purple);
+            letter-spacing:1.5px;margin:4px 0 16px;padding-bottom:8px;
+            border-bottom:1px solid var(--border);
+        }
+
+        @media(max-width:560px){
+            .form-grid-2{grid-template-columns:1fr}
+            .form-grid-2 .full{grid-column:1}
+        }
     </style>
 
     <div class="registro-wrap fade-up">
@@ -96,82 +135,99 @@ include 'header.php';
         <p class="sub">Únete y accede a los mejores precios gaming de México</p>
 
         <?php if($error): ?>
-            <div class="alert alert-error"><?= limpiar($error) ?></div>
+            <div class="alert alert-error" style="margin-bottom:20px">
+                ⚠️ <?= $error ?>
+            </div>
         <?php endif; ?>
 
         <div class="card">
-            <form method="POST" autocomplete="off">
+            <form method="POST" autocomplete="off" novalidate>
 
                 <!-- DATOS PERSONALES -->
-                <h3 style="font-family:'Orbitron',monospace;font-size:.85rem;color:var(--purple);margin-bottom:16px;letter-spacing:1px">
-                    👤 DATOS PERSONALES
-                </h3>
+                <div class="sec-title">👤 DATOS PERSONALES</div>
 
-                <div class="form-grid">
-                    <div class="form-group">
+                <div class="form-grid-2">
+                    <!-- Nombre(s) -->
+                    <div class="form-group full">
                         <label>Nombre(s) <span class="campo-req">*</span></label>
                         <input type="text" name="nombre_s" class="form-control"
                                placeholder="Ej. Juan Carlos"
-                               value="<?= limpiar($_POST['nombre_s']??'') ?>" required>
+                               value="<?= htmlspecialchars($_POST['nombre_s'] ?? '', ENT_QUOTES) ?>"
+                               required autocomplete="given-name">
+                        <div class="campo-hint">Sí se permiten acentos (á, é, í, ó, ú) y ñ</div>
                     </div>
+
+                    <!-- Apellido paterno -->
                     <div class="form-group">
                         <label>Apellido paterno <span class="campo-req">*</span></label>
                         <input type="text" name="ap_paterno" class="form-control"
                                placeholder="Ej. García"
-                               value="<?= limpiar($_POST['ap_paterno']??'') ?>" required>
+                               value="<?= htmlspecialchars($_POST['ap_paterno'] ?? '', ENT_QUOTES) ?>"
+                               required autocomplete="family-name">
                     </div>
+
+                    <!-- Apellido materno -->
                     <div class="form-group">
                         <label>Apellido materno</label>
                         <input type="text" name="ap_materno" class="form-control"
-                               placeholder="Ej. López"
-                               value="<?= limpiar($_POST['ap_materno']??'') ?>">
+                               placeholder="Ej. López (opcional)"
+                               value="<?= htmlspecialchars($_POST['ap_materno'] ?? '', ENT_QUOTES) ?>"
+                               autocomplete="additional-name">
                     </div>
-                    <div class="form-group">
+
+                    <!-- Número de cuenta -->
+                    <div class="form-group full">
                         <label>Número de cuenta</label>
                         <input type="text" name="num_cuenta" class="form-control"
-                               placeholder="Ej. 20251234"
-                               value="<?= limpiar($_POST['num_cuenta']??'') ?>"
-                               inputmode="numeric" maxlength="20">
-                        <div class="hint">8 a 20 dígitos · opcional</div>
+                               placeholder="Ej. 22230706 (solo dígitos, opcional)"
+                               value="<?= htmlspecialchars($_POST['num_cuenta'] ?? '', ENT_QUOTES) ?>"
+                               inputmode="numeric" maxlength="20"
+                               oninput="this.value=this.value.replace(/\D/g,'')">
+                        <div class="campo-hint">Solo números · entre 6 y 20 dígitos · opcional</div>
                     </div>
                 </div>
 
-                <div style="border-top:1px solid var(--border);margin:20px 0"></div>
+                <!-- DATOS DE ACCESO -->
+                <div class="sec-title" style="margin-top:8px">🔐 DATOS DE ACCESO</div>
 
-                <!-- ACCESO -->
-                <h3 style="font-family:'Orbitron',monospace;font-size:.85rem;color:var(--purple);margin-bottom:16px;letter-spacing:1px">
-                    🔐 DATOS DE ACCESO
-                </h3>
+                <div class="form-grid-2">
+                    <!-- Email -->
+                    <div class="form-group full">
+                        <label>Correo electrónico <span class="campo-req">*</span></label>
+                        <input type="email" name="email" class="form-control"
+                               placeholder="Ej. usuario@gmail.com"
+                               value="<?= htmlspecialchars($_POST['email'] ?? '', ENT_QUOTES) ?>"
+                               required autocomplete="email">
+                        <div class="campo-hint">Formato válido: usuario@dominio.com — sin espacios ni caracteres especiales</div>
+                    </div>
 
-                <div class="form-group full">
-                    <label>Correo electrónico <span class="campo-req">*</span></label>
-                    <input type="email" name="email" class="form-control"
-                           placeholder="tu@correo.com"
-                           value="<?= limpiar($_POST['email']??'') ?>" required>
-                </div>
-
-                <div class="form-grid">
+                    <!-- Contraseña -->
                     <div class="form-group">
                         <label>Contraseña <span class="campo-req">*</span></label>
-                        <input type="password" name="password" id="pass-input" class="form-control"
-                               placeholder="Mínimo 6 caracteres" required
+                        <input type="password" name="password" id="pass1" class="form-control"
+                               placeholder="Mínimo 6 caracteres"
+                               required autocomplete="new-password"
                                oninput="medirFuerza(this.value)">
                         <div class="strength-bar"><div class="strength-fill" id="s-fill"></div></div>
-                        <div class="strength-txt" id="s-txt"></div>
+                        <div class="strength-lbl" id="s-lbl"></div>
                     </div>
+
+                    <!-- Confirmar contraseña -->
                     <div class="form-group">
                         <label>Confirmar contraseña <span class="campo-req">*</span></label>
-                        <input type="password" name="password2" id="pass2-input" class="form-control"
-                               placeholder="Repite tu contraseña" required
+                        <input type="password" name="password2" id="pass2" class="form-control"
+                               placeholder="Repite la contraseña"
+                               required autocomplete="new-password"
                                oninput="verificarMatch()">
-                        <div class="hint" id="match-txt"></div>
+                        <div id="match-msg"></div>
                     </div>
                 </div>
 
                 <button type="submit" class="btn btn-primary"
-                        style="width:100%;justify-content:center;margin-top:8px">
+                        style="width:100%;justify-content:center;margin-top:8px;padding:14px">
                     ⚡ CREAR MI CUENTA
                 </button>
+
             </form>
         </div>
 
@@ -182,40 +238,42 @@ include 'header.php';
 
     <script>
         function medirFuerza(v) {
-            const fill = document.getElementById('s-fill');
-            const txt  = document.getElementById('s-txt');
-            let score  = 0;
-            if (v.length >= 6)  score++;
-            if (v.length >= 10) score++;
-            if (/[A-Z]/.test(v)) score++;
-            if (/[0-9]/.test(v)) score++;
+            const fill  = document.getElementById('s-fill');
+            const label = document.getElementById('s-lbl');
+            let score   = 0;
+            if (v.length >= 6)           score++;
+            if (v.length >= 10)          score++;
+            if (/[A-Z]/.test(v))        score++;
+            if (/[0-9]/.test(v))        score++;
             if (/[^A-Za-z0-9]/.test(v)) score++;
+
             const niveles = [
-                {w:'0%',  c:'transparent', t:''},
-                {w:'25%', c:'#ff2d55',     t:'Muy débil'},
-                {w:'50%', c:'#ff6b00',     t:'Débil'},
-                {w:'75%', c:'#f7c948',     t:'Aceptable'},
-                {w:'90%', c:'#39ff14',     t:'Fuerte'},
-                {w:'100%',c:'#00f5ff',     t:'Muy fuerte'},
+                {w:'0%',  c:'transparent',t:''},
+                {w:'20%', c:'#ff2d55',    t:'Muy débil'},
+                {w:'40%', c:'#ff6b00',    t:'Débil'},
+                {w:'65%', c:'#f7c948',    t:'Aceptable'},
+                {w:'85%', c:'#39ff14',    t:'Fuerte'},
+                {w:'100%',c:'#00f5ff',    t:'Muy fuerte ✓'},
             ];
             const n = niveles[Math.min(score, 5)];
             fill.style.width      = n.w;
             fill.style.background = n.c;
-            txt.textContent       = n.t;
-            txt.style.color       = n.c;
+            label.textContent     = n.t;
+            label.style.color     = n.c;
+            verificarMatch();
         }
 
         function verificarMatch() {
-            const p1  = document.getElementById('pass-input').value;
-            const p2  = document.getElementById('pass2-input').value;
-            const txt = document.getElementById('match-txt');
-            if (!p2) { txt.textContent = ''; return; }
+            const p1  = document.getElementById('pass1').value;
+            const p2  = document.getElementById('pass2').value;
+            const msg = document.getElementById('match-msg');
+            if (!p2) { msg.textContent = ''; return; }
             if (p1 === p2) {
-                txt.textContent = '✓ Contraseñas coinciden';
-                txt.style.color = 'var(--green)';
+                msg.className   = 'match-ok';
+                msg.textContent = '✓ Las contraseñas coinciden';
             } else {
-                txt.textContent = '✗ No coinciden';
-                txt.style.color = 'var(--red)';
+                msg.className   = 'match-err';
+                msg.textContent = '✗ No coinciden aún';
             }
         }
     </script>
