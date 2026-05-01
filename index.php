@@ -5,6 +5,11 @@
 session_start();
 require_once 'config.php';
 
+// Crear carpeta tokens si no existe
+if (!is_dir(TOKEN_DIR)) {
+    mkdir(TOKEN_DIR, 0755, true);
+}
+
 // Si ya está logueado, ir a tienda
 if (estaLogueado()) {
     header('Location: ' . BASE_URL . '/tienda.php');
